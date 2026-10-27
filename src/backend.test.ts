@@ -4,6 +4,7 @@ import * as path from 'path';
 import { OpenAPIBackend, Context } from './backend';
 import type { Request } from './router';
 import { OpenAPIV3, OpenAPIV3_1 } from 'openapi-types';
+import type { JSONSchema7 } from 'json-schema';
 
 const testsDir = path.join(__dirname, '..', '__tests__');
 const examplePetAPIJSON = path.join(testsDir, 'resources', 'example-pet-api.openapi.json');
@@ -29,6 +30,216 @@ const pathId: OpenAPIV3_1.ParameterObject = {
     type: 'integer',
   },
 };
+
+describe.each(['3.1.0', '3.1.1', '3.1.2'])('OpenAPI %s if/then/else validation', (openapi) => {
+  const schema = {
+    type: 'object',
+    required: ['kind'],
+    properties: {
+      kind: { type: 'string', enum: ['business', 'personal'] },
+      companyName: { type: 'string' },
+      fullName: { type: 'string' },
+    },
+    if: {
+      required: ['kind'],
+      properties: { kind: { enum: ['business'] } },
+    },
+    then: {
+      required: ['companyName'],
+      properties: { companyName: { minLength: 1 } },
+    },
+    else: {
+      required: ['fullName'],
+      properties: { fullName: { minLength: 1 } },
+    },
+  } satisfies JSONSchema7;
+
+  const { if: condition, then: consequence, else: alternative, ...baseSchema } = schema;
+  const implicationSchema = {
+    ...baseSchema,
+    allOf: [{ anyOf: [{ not: condition }, consequence] }, { anyOf: [condition, alternative] }],
+  } satisfies OpenAPIV3_1.SchemaObject;
+
+  const definition: OpenAPIV3_1.Document = {
+    ...meta,
+    openapi,
+    paths: {
+      '/accounts': {
+        post: {
+          operationId: 'createAccount',
+          requestBody: {
+            required: true,
+            content: { 'application/json': { schema } },
+          },
+          responses: {
+            200: {
+              description: 'Account',
+              content: { 'application/json': { schema } },
+            },
+          },
+        },
+      },
+    },
+  };
+
+  test('normal strict initialization rejects the conditional OpenAPI document', async () => {
+    const api = new OpenAPIBackend({ definition, strict: true });
+    await expect(api.init()).rejects.toThrow('"additionalProperty": "if"');
+  });
+
+  test.each([
+    { name: 'if/then', keywords: { if: condition, then: consequence }, rejectedKeyword: 'if' },
+    { name: 'else', keywords: { else: alternative }, rejectedKeyword: 'else' },
+  ])('document validation rejects $name independently', async ({ keywords, rejectedKeyword }) => {
+    const api = new OpenAPIBackend({
+      definition: {
+        ...definition,
+        paths: {},
+        components: { schemas: { Conditional: { ...baseSchema, ...keywords } } },
+      },
+      strict: true,
+    });
+    await expect(api.init()).rejects.toThrow(`"additionalProperty": "${rejectedKeyword}"`);
+  });
+
+  test.each([
+    { name: 'type null', propertySchema: { type: 'null' as const }, nullValid: true, stringValid: false },
+    { name: 'enum null without type', propertySchema: { enum: [null] }, nullValid: true, stringValid: false },
+    {
+      name: 'enum null with incompatible string type',
+      propertySchema: { type: 'string' as const, enum: [null] },
+      nullValid: false,
+      stringValid: false,
+    },
+    {
+      name: 'nullable string',
+      propertySchema: { type: 'string' as const, nullable: true },
+      nullValid: true,
+      stringValid: true,
+    },
+  ])('checks document and runtime null handling: $name', async ({ propertySchema, nullValid, stringValid }) => {
+    const nullDefinition = {
+      ...definition,
+      paths: {
+        '/accounts': {
+          post: {
+            operationId: 'createAccount',
+            requestBody: {
+              required: true,
+              content: {
+                'application/json': {
+                  schema: { type: 'object', required: ['value'], properties: { value: propertySchema } },
+                },
+              },
+            },
+            responses,
+          },
+        },
+      },
+    } as OpenAPIV3_1.Document;
+    const api = new OpenAPIBackend({ definition: nullDefinition, strict: true });
+    await expect(api.init()).resolves.toBe(api);
+
+    for (const [value, valid] of [
+      [null, nullValid],
+      ['hello', stringValid],
+      [42, false],
+    ] as const) {
+      expect(
+        api.validateRequest({
+          method: 'post',
+          path: '/accounts',
+          headers: { 'content-type': 'application/json' },
+          body: { value },
+        }).valid,
+      ).toBe(valid);
+    }
+  });
+
+  describe.each([
+    { name: 'native conditionals with quick mode bypassing document validation', quick: true, runtimeSchema: schema },
+    {
+      name: 'equivalent implications with normal strict document validation',
+      quick: false,
+      runtimeSchema: implicationSchema,
+    },
+  ])('$name', ({ quick, runtimeSchema }) => {
+    let api: OpenAPIBackend<OpenAPIV3_1.Document>;
+    let operationHandler = jest.fn(() => ({ status: 200 }));
+    let validationFailHandler = jest.fn(() => ({ status: 400 }));
+
+    beforeEach(async () => {
+      operationHandler = jest.fn(() => ({ status: 200 }));
+      validationFailHandler = jest.fn(() => ({ status: 400 }));
+      api = new OpenAPIBackend({
+        definition: {
+          ...definition,
+          components: { schemas: { Account: runtimeSchema } },
+          paths: {
+            '/accounts': {
+              post: {
+                operationId: 'createAccount',
+                requestBody: {
+                  required: true,
+                  content: { 'application/json': { schema: { $ref: '#/components/schemas/Account' } } },
+                },
+                responses: {
+                  200: {
+                    description: 'Account',
+                    content: { 'application/json': { schema: { $ref: '#/components/schemas/Account' } } },
+                  },
+                },
+              },
+            },
+          },
+        },
+        strict: true,
+        quick,
+        handlers: { createAccount: operationHandler, validationFail: validationFailHandler },
+      });
+      await api.init();
+    });
+
+    const cases = [
+      { name: 'valid then branch', body: { kind: 'business', companyName: 'Acme' }, valid: true },
+      { name: 'valid else branch', body: { kind: 'personal', fullName: 'Alex' }, valid: true },
+      { name: 'missing then field', body: { kind: 'business', fullName: 'Alex' }, valid: false },
+      { name: 'missing else field', body: { kind: 'personal', companyName: 'Acme' }, valid: false },
+      { name: 'empty then field', body: { kind: 'business', companyName: '' }, valid: false },
+      { name: 'empty else field', body: { kind: 'personal', fullName: '' }, valid: false },
+      { name: 'inactive else constraint', body: { kind: 'business', companyName: 'Acme', fullName: '' }, valid: true },
+      { name: 'inactive then constraint', body: { kind: 'personal', fullName: 'Alex', companyName: '' }, valid: true },
+      { name: 'missing discriminator', body: { companyName: 'Acme', fullName: 'Alex' }, valid: false },
+      { name: 'unknown discriminator', body: { kind: 'other', fullName: 'Alex' }, valid: false },
+    ];
+
+    test.each(cases)('validates requests: $name', async ({ body, valid }) => {
+      const request = {
+        method: 'post',
+        path: '/accounts',
+        headers: { 'content-type': 'application/json' },
+        body,
+      };
+      const result = api.validateRequest(request);
+      expect(result.valid).toBe(valid);
+      if (!valid) {
+        expect(result.errors?.length).toBeGreaterThan(0);
+      }
+
+      await expect(api.handleRequest(request)).resolves.toEqual({ status: valid ? 200 : 400 });
+      expect(operationHandler).toHaveBeenCalledTimes(valid ? 1 : 0);
+      expect(validationFailHandler).toHaveBeenCalledTimes(valid ? 0 : 1);
+    });
+
+    test.each(cases)('validates responses: $name', ({ body, valid }) => {
+      const result = api.validateResponse(body, 'createAccount', 200);
+      expect(result.valid).toBe(valid);
+      if (!valid) {
+        expect(result.errors?.length).toBeGreaterThan(0);
+      }
+    });
+  });
+});
 
 describe('OpenAPIBackend', () => {
   const definition: OpenAPIV3_1.Document = {
