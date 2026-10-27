@@ -29,7 +29,7 @@ describe.each(['3.2.0', '3.2.1'])('OpenAPI %s new feature probes', (openapi) => 
     ['response summary', { components: { responses: { OK: { description: 'OK', summary: 'Success' } } } }],
     ['optional response description', { components: { responses: { OK: {} } } }],
     ['dataValue', { components: { examples: { Example: { dataValue: { value: 1 } } } } }],
-    ['serializedValue', { components: { examples: { Example: { serializedValue: 'value=1' } } } } }],
+    ['serializedValue', { components: { examples: { Example: { serializedValue: 'value=1' } } } }],
     ['XML nodeType', { components: { schemas: { Value: { type: 'string', xml: { nodeType: 'cdata' } } } } }],
     ['defaultMapping', { components: { schemas: { Value: { oneOf: [{ type: 'string' }, { type: 'number' }], discriminator: { propertyName: 'kind', defaultMapping: 'Other' } }, Other: { type: 'number' } } } }],
     ['OAuth metadata', { components: { securitySchemes: { auth: { type: 'oauth2', oauth2MetadataUrl: 'https://example.com/metadata', flows: { clientCredentials: { tokenUrl: 'https://example.com/token', scopes: {} } } } } } }],
